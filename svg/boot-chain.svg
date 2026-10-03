@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="840" height="560" viewBox="0 0 840 560" version="1.1" xmlns="http://www.w3.org/2000/svg">
+ <defs>
+  <marker id="arrow" overflow="visible" orient="auto-start-reverse" markerWidth="9" markerHeight="7" refX="7" refY="3.5">
+   <path d="M0 0 L8 3.5 L0 7 z" fill="#334155"/>
+  </marker>
+  <style>
+   text { font-family: 'Roboto', Arial, sans-serif; fill: #0f172a; }
+   .phase { font-size: 15px; font-weight: 700; }
+   .box  { fill: #f1f5f9; stroke: #334155; stroke-width: 1.5; }
+   .hl   { fill: #fde68a; stroke: #b45309; stroke-width: 1.8; }
+   .t    { font-size: 15px; font-weight: 600; }
+   .s    { font-size: 11.5px; fill: #475569; }
+   .flow { fill: none; stroke: #334155; stroke-width: 1.7; }
+   .mono { font-family: 'Roboto Mono', monospace; font-size: 13px; font-weight: 600; }
+  </style>
+ </defs>
+
+ <!-- ===== Phase 1: Boot (automatic) ===== -->
+ <text class="phase" x="195" y="40" text-anchor="middle" fill="#334155">Boot — automatic</text>
+
+ <g>
+  <rect class="box" x="50" y="58" width="290" height="54" rx="8"/>
+  <text class="t" x="195" y="80" text-anchor="middle">Zynq BootROM</text>
+  <text class="s" x="195" y="98" text-anchor="middle">loads the first stage from the FAT partition</text>
+ </g>
+ <path class="flow" d="M195 112 V140" marker-end="url(#arrow)"/>
+ <g>
+  <rect class="box" x="50" y="142" width="290" height="54" rx="8"/>
+  <text class="t" x="195" y="164" text-anchor="middle">U-Boot SPL</text>
+  <text class="s" x="195" y="182" text-anchor="middle">mainline first stage — no Xilinx FSBL</text>
+ </g>
+ <path class="flow" d="M195 196 V224" marker-end="url(#arrow)"/>
+ <g>
+  <rect class="box" x="50" y="226" width="290" height="54" rx="8"/>
+  <text class="t" x="195" y="248" text-anchor="middle">U-Boot</text>
+  <text class="s" x="195" y="266" text-anchor="middle">reads MAC from EEPROM, boots the kernel</text>
+ </g>
+ <path class="flow" d="M195 280 V308" marker-end="url(#arrow)"/>
+ <g>
+  <rect class="box" x="50" y="310" width="290" height="54" rx="8"/>
+  <text class="t" x="195" y="332" text-anchor="middle">Linux kernel + device tree</text>
+  <text class="s" x="195" y="350" text-anchor="middle">the PL (FPGA) is still empty here</text>
+ </g>
+
+ <!-- cross arrow: Linux -> start-project -->
+ <path class="flow" d="M340 337 H430 V150 H470" stroke-dasharray="5 3" marker-end="url(#arrow)"/>
+ <text class="s" x="408" y="400" text-anchor="middle">then, from a shell</text>
+
+ <!-- ===== Phase 2: Load the demo (from Linux) ===== -->
+ <text class="phase" x="635" y="40" text-anchor="middle" fill="#b45309">Load the demo — from Linux</text>
+
+ <g>
+  <rect class="hl" x="490" y="124" width="300" height="54" rx="8"/>
+  <text class="mono" x="640" y="147" text-anchor="middle">start-project led_blinker</text>
+  <text class="s" x="640" y="165" text-anchor="middle">applies a device-tree overlay via dtbocfg</text>
+ </g>
+ <path class="flow" d="M640 178 V210" marker-end="url(#arrow)"/>
+ <g>
+  <rect class="box" x="490" y="212" width="300" height="60" rx="8"/>
+  <text class="t" x="640" y="234" text-anchor="middle">fpga-region → FPGA manager</text>
+  <text class="s" x="640" y="252" text-anchor="middle">in-kernel Zynq FPGA manager programs the PL</text>
+  <text class="s" x="640" y="267" text-anchor="middle">from /lib/firmware/led_blinker.bit.bin</text>
+ </g>
+ <path class="flow" d="M640 272 V304" marker-end="url(#arrow)"/>
+ <g>
+  <rect class="hl" x="490" y="306" width="300" height="54" rx="8"/>
+  <text class="t" x="640" y="328" text-anchor="middle">PL programmed → user LED blinks</text>
+  <text class="s" x="640" y="346" text-anchor="middle">pure PL — no userspace program needed</text>
+ </g>
+
+ <text class="s" x="420" y="470" text-anchor="middle">U-Boot does not program the PL on this image; led_blinker (and future SDR bitstreams) load from Linux on demand.</text>
+ <text class="s" x="420" y="488" text-anchor="middle">stop-project removes the overlay and unloads the bitstream.</text>
+</svg>

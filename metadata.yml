@@ -1,0 +1,8 @@
+site_title: TRX-duo Buildroot
+
+description: A mainline Buildroot external tree that builds a bootable SD-card image for the TRX-duo (Zynq-7010) SDR board
+
+source: https://github.com/fventuri/trx-duo-buildroot
+issues: https://github.com/fventuri/trx-duo-buildroot/issues
+
+release_latest: https://github.com/fventuri/trx-duo-buildroot/releases/latest

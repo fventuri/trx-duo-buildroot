@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="760" height="300" viewBox="0 0 760 300" version="1.1" xmlns="http://www.w3.org/2000/svg">
+ <defs>
+  <style>
+   text { font-family: 'Roboto', Arial, sans-serif; fill: #0f172a; }
+   .card { fill: #ffffff; stroke: #334155; stroke-width: 2; }
+   .boot { fill: #dbeafe; stroke: #1d4ed8; stroke-width: 1.5; }
+   .root { fill: #dcfce7; stroke: #15803d; stroke-width: 1.5; }
+   .t   { font-size: 16px; font-weight: 600; }
+   .lbl { font-size: 13px; fill: #334155; }
+   .mono { font-family: 'Roboto Mono', monospace; font-size: 12.5px; fill: #334155; }
+  </style>
+ </defs>
+
+ <text class="t" x="30" y="34">micro-SD card image (sdcard.img)</text>
+
+ <!-- card outline -->
+ <rect class="card" x="30" y="52" width="700" height="150" rx="6"/>
+
+ <!-- FAT boot partition -->
+ <rect class="boot" x="38" y="60" width="230" height="134" rx="4"/>
+ <text class="t"   x="153" y="92"  text-anchor="middle">FAT boot</text>
+ <text class="lbl" x="153" y="112" text-anchor="middle">partition 1</text>
+
+ <!-- ext4 root partition -->
+ <rect class="root" x="276" y="60" width="446" height="134" rx="4"/>
+ <text class="t"   x="499" y="92"  text-anchor="middle">ext4 root filesystem</text>
+ <text class="lbl" x="499" y="112" text-anchor="middle">partition 2 — built by Buildroot</text>
+
+ <!-- contents -->
+ <text class="mono" x="153" y="148" text-anchor="middle">SPL / U-Boot</text>
+ <text class="mono" x="153" y="166" text-anchor="middle">kernel + devicetree</text>
+ <text class="mono" x="153" y="184" text-anchor="middle">boot.scr</text>
+
+ <text class="mono" x="499" y="148" text-anchor="middle">rootfs overlay (board/trx-duo/overlay/)</text>
+ <text class="mono" x="499" y="168" text-anchor="middle">/lib/firmware/led_blinker.bit.bin · start-project</text>
+
+ <text class="lbl" x="30" y="232">The bitstream lives in the rootfs, not on the FAT partition: U-Boot boots Linux, then  start-project led_blinker  programs the PL.</text>
+ <text class="lbl" x="30" y="252">See the led_blinker demo for details.</text>
+</svg>
