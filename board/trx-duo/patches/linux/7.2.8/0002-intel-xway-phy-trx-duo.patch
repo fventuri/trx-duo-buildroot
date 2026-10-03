@@ -1,0 +1,24 @@
+Intel/Lantiq XWAY PHY: TRX-duo LED/config register tweak.
+
+The TRX-duo wires the on-board Intel/Lantiq XWAY (GPY) PHY such that an extra
+write to register 0x17 (value 0xb500) is needed during config_init for the LEDs
+and link to behave. This mirrors the tweak carried in the vendor tree.
+
+NOTE: the @@ line number below is from an older kernel; if this fails to apply
+against 7.2.8, refresh it against drivers/net/phy/intel-xway.c (see claude/).
+
+Signed-off-by: Franco Venturi <fventuri@comcast.net>
+
+--- a/drivers/net/phy/intel-xway.c
++++ b/drivers/net/phy/intel-xway.c
+@@ -252,6 +252,10 @@ static int xway_gphy_config_init(struct phy_device *phydev)
+ 	if (err)
+ 		return err;
+
++	err = phy_write(phydev, 0x17, 0xb500);
++	if (err)
++		return err;
++
+ 	phy_write_mmd(phydev, MDIO_MMD_VEND2, XWAY_MMD_LEDCH,
+ 		      XWAY_MMD_LEDCH_NACS_NONE |
+ 		      XWAY_MMD_LEDCH_SBF_F02HZ |

@@ -1,0 +1,7 @@
+# Fallback boot environment for the TRX-duo.
+# boot.scr (compiled from boot.cmd) is the primary boot path; these variables
+# are here so the board can also be booted by hand from the U-Boot prompt.
+kernel_image=zImage
+devicetree_image=system.dtb
+mmcargs=setenv bootargs console=ttyPS0,115200 root=/dev/mmcblk0p2 rw rootwait earlyprintk
+mmc_boot=run mmcargs; load mmc 0 0x2080000 ${kernel_image} && load mmc 0 0x2000000 ${devicetree_image} && bootz 0x2080000 - 0x2000000

@@ -1,0 +1,14 @@
+# Claude internal docs / handoffs / discussion — not part of the repo
+/claude/
+
+# Local Claude Code settings (machine-specific)
+/.claude/settings.local.json
+
+# Buildroot lives outside this external tree; build artifacts if any land here
+/output/
+/dl/
+*.o
+
+# Editor
+*.swp
+*~

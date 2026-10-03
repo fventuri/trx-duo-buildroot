@@ -1,0 +1,886 @@
+From: Franco Venturi <fventuri@comcast.net>
+Subject: [PATCH] net: macb: fcfb zero-copy UDP TX (in-kernel, "zcudp")
+
+Add an in-kernel zero-copy UDP TX path to the Zynq-7000 GEM (macb) to break the
+~28-31k pps ceiling of userspace sendmmsg(MSG_ZEROCOPY), whose per-datagram
+get_user_pages cost caps fcfb's 40k rec/s stream and drops ~25-30% of blocks at
+high W.  The vendor stack proves the same GEM sustains 40k+ pps at zero overflow
+by building frames in-kernel; this is fcfb's adaptation.
+
+This is NOT a new driver: the new file macb_zcudp.c compiles into macb.o and
+runs as part of macb.  zcudp_probe() is called from macb_probe(); the ioctls
+arrive through macb's new .ndo_siocdevprivate; and the transmit descriptors it
+builds share queue[0]'s HW ring with normal macb traffic (SSH + TCP control).
+It lives in its own file only to keep the TX engine out of the 6200-line
+macb_main.c.  ("zcudp" = zero-copy UDP.)
+
+zcudp is a generic raw datagram-batch transmitter driven by SIOCDEVPRIVATE
+ioctls 0x89f1..0x89f7.  The userspace fcfb_server keeps all framing/packing and
+the frontier chase; per datagram it hands the kernel the inline fcfb header
+bytes plus 1-2 payload fragments as {ring phys, len} into the u-dma-buf PL ring.
+The kernel prepends a templated Eth/IPv4/UDP header (IP length + checksum
+patched per datagram; UDP checksum 0, legal for IPv4) and DMAs each frame out
+GEM queue[0] as a header BD (coherent buffer) + payload BD(s) pointing straight
+at ring phys - no copy, no get_user_pages, no socket path.
+
+Unlike the vendor engine it has no block-fragmentation, no app header, and no
+in-kernel resend ring (fcfb's frontier chase + client seq gate handle loss),
+and it drains SYNCHRONOUSLY with window flow-control on the caller's thread
+(no kthread) because the fcfb ring is ephemeral - the PL overwrites it
+continuously, so a decoupled queue could ship already-clobbered records.
+
+zcudp BDs carry no skb and are not dma_map'd, so macb_tx_complete recycles them
+via the zcudp_flag tag instead of dev_kfree_skb/dma_unmap, and zcudp_tx_inflight
+tracks shared-ring occupancy across both producers.
+
+Signed-off-by: Franco Venturi <fventuri@comcast.net>
+---
+diff --git a/drivers/net/ethernet/cadence/macb.h b/drivers/net/ethernet/cadence/macb.h
+--- a/drivers/net/ethernet/cadence/macb.h	2026-09-27 13:49:45.849464059 -0400
++++ b/drivers/net/ethernet/cadence/macb.h	2026-09-27 13:48:33.690415255 -0400
+@@ -985,6 +985,7 @@
+ 	size_t			size;
+ 	u8			fcs_len;
+ 	bool			mapped_as_page;
++	u32			zcudp_flag;	/* fcfb zcudp: BD tag, 0 for skb BDs */
+ };
+ 
+ /* Hardware-collected statistics. Used when updating the network
+@@ -1281,6 +1282,7 @@
+ 	dma_addr_t		tx_ring_dma;
+ 	struct work_struct	tx_error_task;
+ 	bool			txubr_pending;
++	u32			zcudp_tx_inflight;	/* fcfb zcudp: BDs (skb+zcudp) in HW ring */
+ 	struct napi_struct	napi_tx;
+ 
+ 	dma_addr_t		rx_ring_dma;
+@@ -1395,8 +1397,16 @@
+ 
+ 	struct macb_pm_data pm_data;
+ 	const struct macb_usrio_config *usrio;
++
++	struct zcudp_ctx	*zcudp;		/* fcfb in-kernel zero-copy UDP TX */
+ };
+ 
++/* fcfb zcudp: TX-ring BD helpers shared with zcudp.c (de-static'd in macb_main.c) */
++unsigned int macb_tx_ring_wrap(struct macb *bp, unsigned int index);
++struct macb_dma_desc *macb_tx_desc(struct macb_queue *queue, unsigned int index);
++struct macb_tx_skb *macb_tx_skb(struct macb_queue *queue, unsigned int index);
++void macb_set_addr(struct macb *bp, struct macb_dma_desc *desc, dma_addr_t addr);
++
+ #ifdef CONFIG_MACB_USE_HWSTAMP
+ #define GEM_TSEC_SIZE  (GEM_TSH_SIZE + GEM_TSL_SIZE)
+ #define TSU_SEC_MAX_VAL (((u64)1 << GEM_TSEC_SIZE) - 1)
+diff --git a/drivers/net/ethernet/cadence/macb_main.c b/drivers/net/ethernet/cadence/macb_main.c
+--- a/drivers/net/ethernet/cadence/macb_main.c	2026-09-27 13:49:45.852279248 -0400
++++ b/drivers/net/ethernet/cadence/macb_main.c	2026-09-27 13:48:33.692005018 -0400
+@@ -40,6 +40,7 @@
+ #include <linux/gcd.h>
+ #include <net/pkt_sched.h>
+ #include "macb.h"
++#include "macb_zcudp.h"
+ 
+ /* This structure is only used for MACB on SiFive FU540 devices */
+ struct sifive_fu540_macb_mgmt {
+@@ -150,12 +151,12 @@
+ }
+ 
+ /* Ring buffer accessors */
+-static unsigned int macb_tx_ring_wrap(struct macb *bp, unsigned int index)
++unsigned int macb_tx_ring_wrap(struct macb *bp, unsigned int index)
+ {
+ 	return index & (bp->tx_ring_size - 1);
+ }
+ 
+-static struct macb_dma_desc *macb_tx_desc(struct macb_queue *queue,
++struct macb_dma_desc *macb_tx_desc(struct macb_queue *queue,
+ 					  unsigned int index)
+ {
+ 	index = macb_tx_ring_wrap(queue->bp, index);
+@@ -163,7 +164,7 @@
+ 	return &queue->tx_ring[index];
+ }
+ 
+-static struct macb_tx_skb *macb_tx_skb(struct macb_queue *queue,
++struct macb_tx_skb *macb_tx_skb(struct macb_queue *queue,
+ 				       unsigned int index)
+ {
+ 	return &queue->tx_skb[macb_tx_ring_wrap(queue->bp, index)];
+@@ -1221,7 +1222,7 @@
+ 	}
+ }
+ 
+-static void macb_set_addr(struct macb *bp, struct macb_dma_desc *desc, dma_addr_t addr)
++void macb_set_addr(struct macb *bp, struct macb_dma_desc *desc, dma_addr_t addr)
+ {
+ 	if (macb_dma64(bp)) {
+ 		struct macb_dma_desc_64 *desc_64;
+@@ -1414,11 +1415,14 @@
+ 	unsigned int tail;
+ 	unsigned int head;
+ 	int packets = 0;
++	int zcudp_frames = 0;
+ 	u32 bytes = 0;
++	bool zcudp_woke = false;
+ 
+ 	spin_lock_irqsave(&queue->tx_ptr_lock, flags);
+ 	head = queue->tx_head;
+-	for (tail = queue->tx_tail; tail != head && packets < budget; tail++) {
++	for (tail = queue->tx_tail;
++	     tail != head && packets + zcudp_frames < budget; tail++) {
+ 		struct macb_tx_skb	*tx_skb;
+ 		struct sk_buff		*skb;
+ 		struct macb_dma_desc	*desc;
+@@ -1440,6 +1444,29 @@
+ 		/* Process all buffers of the current transmitted frame */
+ 		for (;; tail++) {
+ 			tx_skb = macb_tx_skb(queue, tail);
++
++			/* Every reclaimed BD (skb or zcudp) frees one ring slot;
++			 * zcudp_tx_inflight tracks the shared ring occupancy so
++			 * the zcudp drain's free-BD math stays correct. */
++			if (queue->zcudp_tx_inflight)
++				queue->zcudp_tx_inflight--;
++
++			/* fcfb zcudp BDs carry no skb and are not dma_map'd:
++			 * recycle the tag, never macb_tx_unmap / kfree_skb. The
++			 * datagram's last BD is flagged COMPLETE (frame end). */
++			if (tx_skb->zcudp_flag & ZCUDP_BD_OWNED) {
++				bool done = tx_skb->zcudp_flag & ZCUDP_BD_COMPLETE;
++
++				tx_skb->zcudp_flag = 0;
++				tx_skb->skb = NULL;
++				zcudp_woke = true;
++				if (done) {
++					zcudp_frames++;
++					break;
++				}
++				continue;
++			}
++
+ 			skb = tx_skb->skb;
+ 
+ 			/* First, update TX stats if needed */
+@@ -1481,6 +1508,10 @@
+ 		netif_wake_subqueue(bp->netdev, queue_index);
+ 	spin_unlock_irqrestore(&queue->tx_ptr_lock, flags);
+ 
++	/* fcfb zcudp: wake a drain that is blocked on GEM ring space. */
++	if (zcudp_woke)
++		zcudp_tx_wake(queue);
++
+ 	if (packets)
+ 		macb_tx_lpi_schedule(bp);
+ 
+@@ -2245,6 +2276,7 @@
+ 		tx_skb->mapping = mapping;
+ 		tx_skb->size = size;
+ 		tx_skb->mapped_as_page = false;
++		tx_skb->zcudp_flag = 0;		/* fcfb: mark as a normal skb BD */
+ 
+ 		len -= size;
+ 		offset += size;
+@@ -2273,6 +2305,7 @@
+ 			tx_skb->mapping = mapping;
+ 			tx_skb->size = size;
+ 			tx_skb->mapped_as_page = true;
++			tx_skb->zcudp_flag = 0;		/* fcfb: normal skb BD */
+ 
+ 			len -= size;
+ 			offset += size;
+@@ -2288,6 +2321,7 @@
+ 
+ 	/* This is the last buffer of the frame: save socket buffer */
+ 	tx_skb->skb = skb;
++	tx_skb->zcudp_flag = 0;			/* fcfb: normal skb BD (not zcudp) */
+ 	tx_skb->fcs_len = fcs_len;
+ 
+ 	/* Update TX ring: update buffer descriptors in reverse order
+@@ -2561,6 +2595,10 @@
+ 		goto unlock;
+ 	}
+ 
++	/* fcfb zcudp: count these skb BDs in the shared-ring occupancy so the
++	 * zcudp drain's free-BD math accounts for concurrent control traffic. */
++	queue->zcudp_tx_inflight += desc_cnt;
++
+ 	/* Make newly initialized descriptor visible to hardware */
+ 	wmb();
+ 	skb_tx_timestamp(skb);
+@@ -2776,7 +2814,9 @@
+ 		queue->rx_ring_dma = rx_dma + macb_rx_ring_size_per_queue(bp) * q;
+ 
+ 		size = bp->tx_ring_size * sizeof(struct macb_tx_skb);
+-		queue->tx_skb = kmalloc(size, GFP_KERNEL);
++		/* fcfb: zeroed so macb_tx_skb.zcudp_flag starts clear (a normal skb
++		 * BD must never be mistaken for a zcudp BD in macb_tx_complete) */
++		queue->tx_skb = kzalloc(size, GFP_KERNEL);
+ 		if (!queue->tx_skb)
+ 			goto out_err;
+ 	}
+@@ -4214,6 +4254,22 @@
+ 	return phylink_mii_ioctl(bp->phylink, rq, cmd);
+ }
+ 
++/* fcfb zcudp: SIOCDEVPRIVATE dispatch (0x89f1..0x89f7) to the zero-copy TX
++ * engine.  SIOCDEVPRIVATE is not routed through .ndo_eth_ioctl, so this needs
++ * its own .ndo_siocdevprivate.  @data is ifr->ifr_data (the userspace payload). */
++static int macb_siocdevprivate(struct net_device *dev, struct ifreq *rq,
++			       void __user *data, int cmd)
++{
++	struct macb *bp = netdev_priv(dev);
++
++	if (cmd < ZCUDP_IOC_SET_TMPL || cmd > ZCUDP_IOC_STATS)
++		return -EOPNOTSUPP;
++	if (!bp->zcudp)
++		return -ENODEV;
++
++	return zcudp_do_ioctl(bp, data, cmd);
++}
++
+ static int macb_hwtstamp_get(struct net_device *netdev,
+ 			     struct kernel_hwtstamp_config *cfg)
+ {
+@@ -4563,6 +4619,7 @@
+ 	.ndo_set_rx_mode	= macb_set_rx_mode,
+ 	.ndo_get_stats64	= macb_get_stats,
+ 	.ndo_eth_ioctl		= macb_ioctl,
++	.ndo_siocdevprivate	= macb_siocdevprivate,
+ 	.ndo_validate_addr	= eth_validate_addr,
+ 	.ndo_change_mtu		= macb_change_mtu,
+ 	.ndo_set_mac_address	= macb_set_mac_addr,
+@@ -5964,6 +6021,11 @@
+ 		    macb_is_gem(bp) ? "GEM" : "MACB", macb_readl(bp, MID),
+ 		    netdev->base_addr, netdev->irq, netdev->dev_addr);
+ 
++	/* fcfb zcudp: in-kernel zero-copy UDP TX (GEM only). Non-fatal on
++	 * failure - the NIC still works, just without the fast egress. */
++	if (macb_is_gem(bp) && zcudp_probe(bp))
++		netdev_warn(netdev, "zcudp: init failed; zero-copy TX unavailable\n");
++
+ 	pm_runtime_put_autosuspend(&bp->pdev->dev);
+ 
+ 	return 0;
+@@ -5999,6 +6061,7 @@
+ 
+ 	if (netdev) {
+ 		bp = netdev_priv(netdev);
++		zcudp_remove(bp);		/* fcfb zcudp: free TX engine */
+ 		unregister_netdev(netdev);
+ 		phy_exit(bp->phy);
+ 		if (bp->mii_bus) {
+diff --git a/drivers/net/ethernet/cadence/macb_zcudp.c b/drivers/net/ethernet/cadence/macb_zcudp.c
+--- a/drivers/net/ethernet/cadence/macb_zcudp.c	1969-12-31 19:00:00.000000000 -0500
++++ b/drivers/net/ethernet/cadence/macb_zcudp.c	2026-09-27 13:57:27.809642573 -0400
+@@ -0,0 +1,451 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * macb_zcudp.c - fcfb in-kernel zero-copy UDP TX for the GEM.
++ *
++ * This is NOT a separate driver: it compiles into macb.o (macb-y) and runs as
++ * part of the macb driver on the same struct macb / eth0.  zcudp_probe() is
++ * called from macb_probe(), the ioctls arrive via macb's .ndo_siocdevprivate,
++ * and the BDs it builds share queue[0]'s HW ring with normal macb traffic.
++ * The code lives in its own file only to keep the ~430-line TX engine out of
++ * the 6200-line macb_main.c.  ("zcudp" = zero-copy UDP.)
++ *
++ * A generic raw datagram-batch transmitter.  The userspace fcfb_server hands
++ * the driver a batch of pre-formed datagrams (inline fcfb header bytes + 1-2
++ * payload fragments given as {ring phys, len}); the driver prepends a
++ * templated Eth/IPv4/UDP header (IP length + IP checksum patched per datagram,
++ * UDP checksum 0 which is legal for IPv4) and DMAs each frame out through GEM
++ * queue[0] with two buffer descriptors: a header BD (coherent header buffer)
++ * and one/two payload BDs pointing straight at the u-dma-buf PL ring - so the
++ * payload is never copied and get_user_pages is never called.  This bypasses
++ * the socket path entirely, which is what breaks the ~28-31k pps sendmmsg wall.
++ *
++ * Inspired by Primoz Beltram's reverse-engineered vendor "npapi" engine, but
++ * adapted to fcfb:
++ * no block-fragmentation, no app-header, no in-kernel resend ring, and a
++ * SYNCHRONOUS windowed drain (no CPU1 kthread) because the fcfb ring is
++ * ephemeral - the PL overwrites it continuously and the server only sends
++ * within DRAIN_LAG of the frontier, so a decoupled queue could ship data the
++ * PL has already clobbered.  The drain runs on the caller's thread and blocks
++ * on TX completions when the GEM ring window is full.
++ *
++ * zcudp BDs share queue[0]'s HW ring with normal skb traffic (SSH + the TCP
++ * control channel).  They carry no skb and are not dma_map'd, so the TX
++ * completion path must recycle them via the zcudp_flag tag (see macb_tx_complete
++ * in macb_main.c), never dev_kfree_skb / dma_unmap.
++ */
++
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/wait.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/platform_device.h>
++#include <linux/if.h>
++#include <linux/ip.h>
++#include <linux/udp.h>
++#include <linux/uaccess.h>
++#include <linux/dma-mapping.h>
++#include <linux/slab.h>
++
++#include "macb.h"
++#include "macb_zcudp.h"
++
++/* Templated 42-byte Eth/IPv4/UDP header (offsets match the on-wire frame). */
++struct zcudp_l34 {
++	u8	dst_mac[6];	/* 0x00 */
++	u8	src_mac[6];	/* 0x06 */
++	__be16	ethertype;	/* 0x0c */
++	u8	ip_vhl;		/* 0x0e = 0x45 */
++	u8	ip_tos;		/* 0x0f */
++	__be16	ip_len;		/* 0x10 total IP length (patched) */
++	__be16	ip_id;		/* 0x12 */
++	__be16	ip_frag;	/* 0x14 */
++	u8	ip_ttl;		/* 0x16 */
++	u8	ip_proto;	/* 0x17 */
++	__be16	ip_csum;	/* 0x18 (patched) */
++	__be32	ip_src;		/* 0x1a */
++	__be32	ip_dst;		/* 0x1e */
++	__be16	udp_src;	/* 0x22 */
++	__be16	udp_dst;	/* 0x24 */
++	__be16	udp_len;	/* 0x26 (patched) */
++	__be16	udp_csum;	/* 0x28 (0) */
++} __packed;
++
++/* Standard IPv4 header checksum over 20 bytes (ip_csum field must be 0). */
++static __be16 zcudp_ip_csum(const struct zcudp_l34 *h)
++{
++	const __be16 *p = (const __be16 *)&h->ip_vhl;	/* IP header start */
++	u32 sum = 0;
++	int i;
++
++	for (i = 0; i < 10; i++)
++		sum += (__force u16)p[i];
++	sum = (sum & 0xffff) + (sum >> 16);
++	sum = (sum & 0xffff) + (sum >> 16);
++	return (__force __be16)(~sum & 0xffff);
++}
++
++/* Rebuild the static L34 template from np->tmpl (called on SET_TMPL). */
++static void zcudp_build_tmpl(struct zcudp_ctx *np)
++{
++	struct zcudp_l34 *h = (struct zcudp_l34 *)np->l34;
++
++	memset(h, 0, sizeof(*h));
++	ether_addr_copy(h->dst_mac, np->tmpl.dst_mac);
++	ether_addr_copy(h->src_mac, np->tmpl.src_mac);
++	h->ethertype = cpu_to_be16(ETH_P_IP);
++	h->ip_vhl    = 0x45;
++	h->ip_ttl    = 64;
++	h->ip_proto  = IPPROTO_UDP;
++	h->ip_frag   = cpu_to_be16(0x4000);		/* Don't Fragment */
++	h->ip_src    = cpu_to_be32(np->tmpl.src_ip);
++	h->ip_dst    = cpu_to_be32(np->tmpl.dst_ip);
++	h->udp_src   = cpu_to_be16(np->tmpl.src_port);
++	h->udp_dst   = cpu_to_be16(np->tmpl.dst_port);
++	np->tmpl_valid = true;
++}
++
++/* True if [phys, phys+len) lies inside the declared ring window. */
++static bool zcudp_frag_ok(struct zcudp_ctx *np, u32 phys, u32 len)
++{
++	if (!len || len > np->mtu)
++		return false;
++	if (!np->ring_end)		/* not armed with bounds -> reject */
++		return false;
++	return phys >= np->ring_phys && (phys + len) <= np->ring_end &&
++	       (phys + len) > phys;			/* no wrap overflow */
++}
++
++/*
++ * Place one datagram at ring index *headp (caller holds tx_ptr_lock and has
++ * verified there is room for 1 + nfrag BDs plus the trailing sentinel).
++ * Builds a header BD (coherent header buffer, ip/udp length + ip csum patched)
++ * followed by nfrag payload BDs pointing at ring phys.  Returns #BDs placed.
++ */
++static unsigned int zcudp_place(struct zcudp_ctx *np, struct macb_queue *q,
++				unsigned int *headp,
++				const struct zcudp_dgram_desc *d)
++{
++	struct macb *bp = np->bp;
++	unsigned int head = *headp;
++	unsigned int slot = macb_tx_ring_wrap(bp, head);
++	u32 hoff = slot * np->hdr_stride;
++	struct zcudp_l34 *h = (struct zcudp_l34 *)((u8 *)np->hdr_va + hoff);
++	dma_addr_t hdma = np->hdr_dma + hoff;
++	u32 hdr_len = min_t(u32, d->hdr_len, ZCUDP_MAX_INLINE_HDR);
++	u32 payload = 0, hbd_len, i;
++	struct macb_dma_desc *desc;
++	struct macb_tx_skb *ts;
++	u32 ctrl;
++
++	for (i = 0; i < d->nfrag; i++)
++		payload += d->frag_len[i];
++
++	/* header buffer = L34 template + inline fcfb header */
++	memcpy(h, np->l34, ZCUDP_L34_LEN);
++	h->ip_len  = cpu_to_be16(28 + hdr_len + payload);	/* IP20+UDP8+app */
++	h->udp_len = cpu_to_be16(8 + hdr_len + payload);	/* UDP8+app */
++	h->ip_csum = 0;
++	h->ip_csum = zcudp_ip_csum(h);
++	memcpy((u8 *)h + ZCUDP_L34_LEN, d->hdr, hdr_len);
++	hbd_len = ZCUDP_L34_LEN + hdr_len;
++
++	/* header BD */
++	desc = macb_tx_desc(q, head);
++	ctrl = hbd_len;
++	if (macb_tx_ring_wrap(bp, head) == bp->tx_ring_size - 1)
++		ctrl |= MACB_BIT(TX_WRAP);
++	macb_set_addr(bp, desc, hdma);
++	desc->ctrl = ctrl;
++	ts = macb_tx_skb(q, head);
++	ts->skb = NULL;
++	ts->mapping = 0;
++	ts->size = hbd_len;
++	ts->mapped_as_page = false;
++	ts->zcudp_flag = ZCUDP_BD_OWNED;
++	head++;
++
++	/* payload BDs - zero-copy straight out of the ring phys */
++	for (i = 0; i < d->nfrag; i++) {
++		bool last = (i == d->nfrag - 1);
++
++		desc = macb_tx_desc(q, head);
++		ctrl = d->frag_len[i];
++		if (last)
++			ctrl |= MACB_BIT(TX_LAST);
++		if (macb_tx_ring_wrap(bp, head) == bp->tx_ring_size - 1)
++			ctrl |= MACB_BIT(TX_WRAP);
++		macb_set_addr(bp, desc, (dma_addr_t)d->frag_phys[i]);
++		desc->ctrl = ctrl;
++		ts = macb_tx_skb(q, head);
++		ts->skb = NULL;
++		ts->mapping = 0;
++		ts->size = d->frag_len[i];
++		ts->mapped_as_page = false;
++		ts->zcudp_flag = ZCUDP_BD_OWNED | (last ? ZCUDP_BD_COMPLETE : 0);
++		head++;
++	}
++
++	np->c_bytes += hbd_len + payload;
++	*headp = head;
++	return 1 + d->nfrag;
++}
++
++/* Write the used/wrap sentinel at *head so HW stops there, then kick TX. */
++static void zcudp_kick(struct zcudp_ctx *np, struct macb_queue *q,
++		       unsigned int head)
++{
++	struct macb *bp = np->bp;
++	struct macb_dma_desc *s = macb_tx_desc(q, head);
++
++	macb_set_addr(bp, s, 0);
++	s->ctrl = MACB_BIT(TX_USED);
++	if (macb_tx_ring_wrap(bp, head) == bp->tx_ring_size - 1)
++		s->ctrl |= MACB_BIT(TX_WRAP);
++
++	wmb();		/* descriptors visible before TSTART */
++	macb_writel(bp, NCR, macb_readl(bp, NCR) | MACB_BIT(TSTART));
++	q->tx_head = head;
++}
++
++/* Free BDs available right now (leave 2 slack: the sentinel + a guard). */
++static u32 zcudp_free_bds(struct macb *bp, struct macb_queue *q)
++{
++	u32 inflight = q->zcudp_tx_inflight;
++
++	if (inflight + 2 >= bp->tx_ring_size)
++		return 0;
++	return bp->tx_ring_size - inflight - 2;
++}
++
++/* 0x89f4: drain a userspace batch of datagrams into the GEM ring. */
++static int zcudp_ioc_tx_batch(struct zcudp_ctx *np, void __user *data)
++{
++	struct macb *bp = np->bp;
++	struct macb_queue *q = np->queue;
++	struct zcudp_dgram_desc *db = np->stage;
++	struct zcudp_tx_batch bt;
++	u32 done = 0, accepted = 0;
++	int rc = 0;
++	void __user *udescs;
++
++	if (!np->tmpl_valid || !np->armed)
++		return -ENODEV;
++	if (copy_from_user(&bt, data, sizeof(bt)))
++		return -EFAULT;
++	if (!bt.count)
++		return 0;
++	udescs = (void __user *)(uintptr_t)bt.descs;
++
++	mutex_lock(&np->tx_lock);
++	while (done < bt.count && !signal_pending(current)) {
++		u32 n = min_t(u32, bt.count - done, ZCUDP_STAGE);
++		u32 i = 0;
++
++		if (copy_from_user(db, udescs + done * sizeof(db[0]),
++				   n * sizeof(db[0]))) {
++			rc = -EFAULT;
++			goto out;
++		}
++
++		while (i < n) {
++			unsigned long flags;
++			unsigned int head, start;
++			u32 placed = 0, free;
++
++			spin_lock_irqsave(&q->tx_ptr_lock, flags);
++			start = head = q->tx_head;
++			free = zcudp_free_bds(bp, q);
++
++			/* pack as many datagrams as fit in the current window */
++			while (i < n) {
++				struct zcudp_dgram_desc *d = &db[i];
++				u32 need;
++				u32 f;
++
++				if (d->nfrag < 1 || d->nfrag > ZCUDP_MAX_FRAGS) {
++					np->c_dropped++; i++; continue;
++				}
++				for (f = 0; f < d->nfrag; f++)
++					if (!zcudp_frag_ok(np, d->frag_phys[f],
++							   d->frag_len[f]))
++						break;
++				if (f != d->nfrag) {	/* bad fragment */
++					np->c_dropped++; i++; continue;
++				}
++
++				need = 1 + d->nfrag;
++				if ((head - start) + need > free)
++					break;		/* window full */
++
++				zcudp_place(np, q, &head, d);
++				placed += need;
++				np->c_dgrams++;
++				accepted++;
++				i++;
++			}
++
++			if (placed) {
++				/* Account the placed BDs in the shared-ring
++				 * occupancy BEFORE releasing the lock.  Without
++				 * this, zcudp_free_bds() always reports the ring
++				 * nearly empty, the drain never blocks on the
++				 * window, and a sustained stream laps tx_head past
++				 * the untransmitted BDs -> overwritten in-flight
++				 * descriptors wedge the GEM (dead at high pps;
++				 * low-W never fills the ring so it was masked). */
++				q->zcudp_tx_inflight += placed;
++				zcudp_kick(np, q, head);
++			}
++			spin_unlock_irqrestore(&q->tx_ptr_lock, flags);
++
++			if (i < n) {
++				/* window full: wait for TX completions to free
++				 * BDs (or a signal), then retry the remainder. */
++				np->c_underruns++;
++				wait_event_interruptible(np->wq_space,
++					zcudp_free_bds(bp, q) >= (1 + ZCUDP_MAX_FRAGS) ||
++					signal_pending(current));
++			}
++		}
++		done += n;
++	}
++
++out:
++	mutex_unlock(&np->tx_lock);
++	bt.count = accepted;
++	if (copy_to_user(data, &bt, sizeof(bt)))
++		return -EFAULT;
++	return rc;
++}
++
++/* called from macb_tx_complete after reclaiming zcudp BDs */
++void zcudp_tx_wake(struct macb_queue *queue)
++{
++	struct zcudp_ctx *np = queue->bp->zcudp;
++
++	if (np)
++		wake_up_interruptible(&np->wq_space);
++}
++
++/* ---- ioctls --------------------------------------------------------------- */
++static int zcudp_ioc_set_tmpl(struct zcudp_ctx *np, void __user *data)
++{
++	if (copy_from_user(&np->tmpl, data, sizeof(np->tmpl)))
++		return -EFAULT;
++	zcudp_build_tmpl(np);
++	return 0;
++}
++
++static int zcudp_ioc_set_mtu(struct zcudp_ctx *np, void __user *data)
++{
++	u32 mtu;
++
++	if (copy_from_user(&mtu, data, sizeof(mtu)))
++		return -EFAULT;
++	if (mtu < 128 || mtu > 10240)
++		return -EINVAL;
++	np->mtu = mtu;
++	return 0;
++}
++
++static int zcudp_ioc_arm(struct zcudp_ctx *np, void __user *data)
++{
++	struct zcudp_arm a;
++
++	if (copy_from_user(&a, data, sizeof(a)))
++		return -EFAULT;
++	if (a.arm) {
++		if (!a.ring_size || a.ring_phys + a.ring_size < a.ring_phys)
++			return -EINVAL;
++		np->ring_phys = a.ring_phys;
++		np->ring_end  = a.ring_phys + a.ring_size;
++		np->armed = 1;
++	} else {
++		np->armed = 0;
++	}
++	return 0;
++}
++
++static int zcudp_ioc_stats(struct zcudp_ctx *np, void __user *data)
++{
++	struct zcudp_stats s;
++
++	memset(&s, 0, sizeof(s));
++	s.tx_dgrams = np->c_dgrams;
++	s.tx_bytes  = np->c_bytes;
++	s.underruns = np->c_underruns;
++	s.dropped   = np->c_dropped;
++	s.inflight  = np->queue->zcudp_tx_inflight;
++	if (copy_to_user(data, &s, sizeof(s)))
++		return -EFAULT;
++	return 0;
++}
++
++int zcudp_do_ioctl(struct macb *bp, void __user *data, int cmd)
++{
++	struct zcudp_ctx *np = bp->zcudp;
++
++	if (!np)
++		return -ENODEV;
++
++	switch (cmd) {
++	case ZCUDP_IOC_SET_TMPL:	return zcudp_ioc_set_tmpl(np, data);
++	case ZCUDP_IOC_SET_MTU:		return zcudp_ioc_set_mtu(np, data);
++	case ZCUDP_IOC_TX_BATCH:	return zcudp_ioc_tx_batch(np, data);
++	case ZCUDP_IOC_ARM:		return zcudp_ioc_arm(np, data);
++	case ZCUDP_IOC_STATS:		return zcudp_ioc_stats(np, data);
++	default:			return -EOPNOTSUPP;
++	}
++}
++
++/* ---- probe / remove ------------------------------------------------------- */
++int zcudp_probe(struct macb *bp)
++{
++	struct zcudp_ctx *np;
++
++	np = kzalloc(sizeof(*np), GFP_KERNEL);
++	if (!np)
++		return -ENOMEM;
++
++	np->bp = bp;
++	np->queue = &bp->queues[0];
++	np->mtu = ZCUDP_DEFAULT_MTU;
++	np->hdr_stride = ZCUDP_HDR_STRIDE;
++	np->hdr_size = (size_t)bp->tx_ring_size * np->hdr_stride;
++	np->hdr_va = dma_alloc_coherent(&bp->pdev->dev, np->hdr_size,
++					&np->hdr_dma, GFP_KERNEL);
++	if (!np->hdr_va) {
++		kfree(np);
++		return -ENOMEM;
++	}
++	np->stage = kmalloc_array(ZCUDP_STAGE, sizeof(*np->stage), GFP_KERNEL);
++	if (!np->stage) {
++		dma_free_coherent(&bp->pdev->dev, np->hdr_size,
++				  np->hdr_va, np->hdr_dma);
++		kfree(np);
++		return -ENOMEM;
++	}
++	init_waitqueue_head(&np->wq_space);
++	mutex_init(&np->tx_lock);
++
++	bp->zcudp = np;
++	netdev_info(bp->netdev,
++		    "zcudp: zero-copy UDP TX ready (tx_ring %u, hdrbuf %zuK)\n",
++		    bp->tx_ring_size, np->hdr_size >> 10);
++	return 0;
++}
++
++void zcudp_remove(struct macb *bp)
++{
++	struct zcudp_ctx *np = bp->zcudp;
++
++	if (!np)
++		return;
++	bp->zcudp = NULL;
++	if (np->hdr_va)
++		dma_free_coherent(&bp->pdev->dev, np->hdr_size,
++				  np->hdr_va, np->hdr_dma);
++	kfree(np->stage);
++	kfree(np);
++}
+diff --git a/drivers/net/ethernet/cadence/macb_zcudp.h b/drivers/net/ethernet/cadence/macb_zcudp.h
+--- a/drivers/net/ethernet/cadence/macb_zcudp.h	1969-12-31 19:00:00.000000000 -0500
++++ b/drivers/net/ethernet/cadence/macb_zcudp.h	2026-09-27 13:42:36.268522686 -0400
+@@ -0,0 +1,144 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * macb_zcudp.h - fcfb in-kernel zero-copy UDP TX for the Zynq-7000 GEM.
++ * ("zcudp" = zero-copy UDP.)  Compiled into macb.o; not a separate driver.
++ *
++ * Inspired by Primoz Beltram's reverse-engineered vendor "npapi" engine
++ * (behavioural reference only), but adapted to fcfb: it is a *generic raw
++ * datagram-batch transmitter*, not the vendor's block-fragmentation +
++ * app-header + resend engine.  All framing, packing and the frontier chase
++ * stay in the userspace fcfb_server; the kernel just emits pre-formed
++ * datagrams zero-copy straight out of the u-dma-buf PL ring.
++ *
++ * Per datagram the server supplies: the inline fcfb UDP-payload header bytes
++ * (the fcfb_udp_hdr, prepended verbatim) and 1-2 payload fragments given as
++ * {phys, len} into the ring.  The kernel prepends a templated Eth/IPv4/UDP
++ * header (IP length patched + IP checksum computed per datagram; UDP checksum
++ * left 0, which is legal for IPv4) and DMAs it out through GEM queue[0].
++ *
++ * Only fcfb_server and this driver share this ABI; it need match nothing else.
++ * The SIOCDEVPRIVATE numbers (0x89f1..) are reused purely so the dispatch slots
++ * into macb's private-ioctl range the same way.
++ */
++#ifndef _FCFB_ZCUDP_H
++#define _FCFB_ZCUDP_H
++
++#include <linux/types.h>
++#include <linux/spinlock.h>
++#include <linux/mutex.h>
++#include <linux/wait.h>
++#include <linux/dma-mapping.h>
++
++struct macb;
++struct macb_queue;
++
++/* ---- ioctl numbers (SIOCDEVPRIVATE range) --------------------------------- */
++#define ZCUDP_IOC_SET_TMPL	0x89f1	/* set Eth/IP/UDP header template     */
++#define ZCUDP_IOC_SET_MTU	0x89f3	/* set MTU (IP length budget)         */
++#define ZCUDP_IOC_TX_BATCH	0x89f4	/* transmit a batch of datagrams      */
++#define ZCUDP_IOC_ARM		0x89f6	/* arm/disarm + set ring phys bounds  */
++#define ZCUDP_IOC_STATS		0x89f7	/* read TX counters (for -D diag)     */
++
++/* ---- limits --------------------------------------------------------------- */
++#define ZCUDP_MAX_FRAGS		2	/* ring wrap needs at most 2 fragments */
++#define ZCUDP_MAX_INLINE_HDR	32	/* fcfb_udp_hdr is 12 B; 32 is headroom */
++#define ZCUDP_L34_LEN		42	/* Eth(14) + IPv4(20) + UDP(8)         */
++#define ZCUDP_HDR_STRIDE	128	/* coherent header-buffer slot stride  */
++#define ZCUDP_STAGE		32	/* descriptors copied per drain chunk  */
++#define ZCUDP_DEFAULT_MTU	3980
++
++/* per-BD zcudp tag stored in macb_tx_skb.zcudp_flag (skb is NULL for these) */
++#define ZCUDP_BD_OWNED		0x40000000u	/* this BD belongs to zcudp     */
++#define ZCUDP_BD_COMPLETE	0x80000000u	/* last BD of a datagram        */
++
++/* ---- ioctl payloads (ifreq.ifr_data ->) ---------------------------------- */
++
++/* 0x89f1: header template.  IPs/ports in host byte order. */
++struct zcudp_tmpl {
++	__u8	dst_mac[6];
++	__u8	src_mac[6];
++	__u32	src_ip;
++	__u32	dst_ip;
++	__u16	src_port;
++	__u16	dst_port;
++} __packed;
++
++/* 0x89f6: arm(1)/disarm(0) and declare the ring phys window for bounds-check. */
++struct zcudp_arm {
++	__u32	arm;
++	__u32	ring_phys;
++	__u32	ring_size;
++} __packed;
++
++/* one datagram descriptor (flat; batch-copied from userspace) */
++struct zcudp_dgram_desc {
++	__u32	hdr_len;			/* inline header bytes that follow   */
++	__u32	nfrag;				/* 1 or 2                            */
++	__u32	frag_phys[ZCUDP_MAX_FRAGS];	/* ring phys of each fragment       */
++	__u32	frag_len[ZCUDP_MAX_FRAGS];	/* length of each fragment          */
++	__u8	hdr[ZCUDP_MAX_INLINE_HDR];	/* fcfb_udp_hdr bytes to prepend    */
++} __packed;
++
++/* 0x89f4: TX batch header; driver writes #accepted back into count. */
++struct zcudp_tx_batch {
++	__u32	count;		/* #descriptors; <- #accepted on return */
++	__u32	descs;		/* userspace pointer to zcudp_dgram_desc[] */
++} __packed;
++
++/* 0x89f7: TX counters. */
++struct zcudp_stats {
++	__u32	tx_dgrams;	/* datagrams handed to the GEM */
++	__u32	tx_bytes;	/* payload+header bytes emitted (wraps; delta-based) */
++	__u32	underruns;	/* times the drain waited on ring space */
++	__u32	dropped;	/* descriptors rejected (bad frag/bounds) */
++	__u32	inflight;	/* current queue[0].zcudp_tx_inflight */
++	__u32	rsvd[7];
++} __packed;
++
++/* ---- per-netdev context (allocated in zcudp_probe) ------------------------ */
++struct zcudp_ctx {
++	struct macb		*bp;
++	struct macb_queue	*queue;		/* queue[0]: the shared TX ring */
++
++	unsigned int		mtu;
++
++	/* pre-built L2/L3/L4 template bytes (42), rebuilt on SET_TMPL */
++	struct zcudp_tmpl	tmpl;
++	__u8			l34[ZCUDP_L34_LEN];
++	bool			tmpl_valid;
++
++	/* coherent header buffers, one per TX-ring slot (indexed by ring slot,
++	 * so a header BD's buffer lives exactly as long as the BD does) */
++	void			*hdr_va;
++	dma_addr_t		hdr_dma;
++	size_t			hdr_size;
++	unsigned int		hdr_stride;
++
++	/* ring phys bounds for fragment validation (set at arm) */
++	u32			ring_phys;
++	u32			ring_end;
++	u32			armed;
++
++	/* flow control: drain waits here for TX completions to free BDs */
++	wait_queue_head_t	wq_space;
++
++	/* TX-batch drain: serialize callers + off-stack descriptor staging */
++	struct mutex		tx_lock;
++	struct zcudp_dgram_desc	*stage;		/* ZCUDP_STAGE entries */
++
++	/* counters */
++	u32			c_dgrams;
++	u32			c_bytes;
++	u32			c_underruns;
++	u32			c_dropped;
++};
++
++/* ---- entry points used by macb_main.c ------------------------------------- */
++int  zcudp_probe(struct macb *bp);
++void zcudp_remove(struct macb *bp);
++int  zcudp_do_ioctl(struct macb *bp, void __user *data, int cmd);
++
++/* called from macb_tx_complete after zcudp BDs are reclaimed: wake the drain. */
++void zcudp_tx_wake(struct macb_queue *queue);
++
++#endif /* _FCFB_ZCUDP_H */
+diff --git a/drivers/net/ethernet/cadence/Makefile b/drivers/net/ethernet/cadence/Makefile
+--- a/drivers/net/ethernet/cadence/Makefile	2026-09-27 13:49:45.849409884 -0400
++++ b/drivers/net/ethernet/cadence/Makefile	2026-09-27 13:42:36.267955705 -0400
+@@ -2,7 +2,7 @@
+ #
+ # Makefile for the Atmel network device drivers.
+ #
+-macb-y	:= macb_main.o
++macb-y	:= macb_main.o macb_zcudp.o
+ 
+ ifeq ($(CONFIG_MACB_USE_HWSTAMP),y)
+ macb-y	+= macb_ptp.o

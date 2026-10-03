@@ -1,0 +1,49 @@
+#!/bin/sh
+#
+# stop-project <name> - tear down an SDR project started with start-project:
+#   1. stop the project's userspace app (if any), then
+#   2. remove the device-tree overlay (unbinds the project's PL drivers and
+#      disables the PS<->PL bridges).
+#
+# NOTE: on Zynq the PL keeps whatever bitstream was last loaded - removing the
+# overlay does NOT blank the fabric (there is no software "erase"). A pure-PL
+# design like led_blinker keeps running until you start a different project or
+# reboot. For a project with a userspace app, stopping that app is the
+# meaningful "stop"; the idle PL design left behind is harmless.
+
+PROJECTS_DIR=/usr/share/trx-duo/projects
+OVERLAYS=/sys/kernel/config/device-tree/overlays
+FPGA_STATE=/sys/class/fpga_manager/fpga0/state
+
+name="$1"
+[ -n "$name" ] || { echo "usage: stop-project <name>" >&2; exit 2; }
+projdir="$PROJECTS_DIR/$name"
+ov="$OVERLAYS/$name"
+
+# Stop the app first so it releases the PL cleanly.
+if [ -x "$projdir/app-stop" ]; then
+	echo "stop-project: stopping '$name' app..."
+	"$projdir/app-stop" || true
+fi
+
+if [ -d "$ov" ]; then
+	echo "stop-project: removing overlay for '$name'..."
+	echo 0 > "$ov/status" 2>/dev/null
+	rmdir "$ov" 2>/dev/null
+	echo "stop-project: '$name' stopped (app + overlay)."
+else
+	echo "stop-project: '$name' is not loaded."
+fi
+
+# NOTE on the current-gateware record (/tmp/current-gateware): it is intentionally
+# NOT removed here. Removing the overlay does not blank the fabric, so the same
+# gateware is still programmed and the record stays accurate. It is cleared only
+# when the fabric actually changes: start-project drops it before (re)programming
+# and rewrites it, and a reboot clears it (tmpfs).
+
+# The PL itself is not cleared by removing the overlay.
+if [ "$(cat "$FPGA_STATE" 2>/dev/null)" = "operating" ]; then
+	echo "stop-project: note: the PL is still configured - Zynq holds the last"
+	echo "              bitstream until reprogrammed. Start another project or"
+	echo "              reboot to change what the fabric does."
+fi

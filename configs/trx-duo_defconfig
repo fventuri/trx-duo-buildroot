@@ -1,0 +1,93 @@
+# TRX-duo (Zynq-7010) Buildroot external tree
+# Toolchain: Buildroot-native (glibc/uClibc default), gcc 15.x
+# Kernel: mainline Linux 7.2.8 (NOT the Xilinx fork)
+# U-Boot: mainline v2026.07 (NOT the Xilinx fork), SPL as first stage
+BR2_arm=y
+BR2_cortex_a9=y
+BR2_ARM_ENABLE_NEON=y
+BR2_ARM_ENABLE_VFP=y
+BR2_GCC_VERSION_15_X=y
+BR2_TOOLCHAIN_BUILDROOT_CXX=y
+# Toolchain sysroot kernel headers: manually-specified version 7.2.8 (matches the
+# kernel). The companion "Custom kernel headers series" is set to "7.1.x or later"
+# (the newest series this Buildroot knows) which selects HEADERS_AT_LEAST_7_1 and,
+# through it, HEADERS_LATEST -> the headers-version check runs "loose" (7.2 >= 7.1)
+# instead of strict, so the newer-than-known 7.2.8 headers are accepted.
+BR2_KERNEL_HEADERS_VERSION=y
+BR2_DEFAULT_KERNEL_VERSION="7.2.8"
+BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_7_1=y
+BR2_CCACHE=y
+BR2_GLOBAL_PATCH_DIR="$(BR2_EXTERNAL_TRXDUO_PATH)/board/trx-duo/patches"
+BR2_TARGET_GENERIC_HOSTNAME="trx-duo"
+BR2_TARGET_GENERIC_ISSUE="Welcome to TRX-duo"
+BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_MDEV=y
+BR2_TARGET_GENERIC_ROOT_PASSWD="root"
+BR2_TARGET_GENERIC_GETTY_PORT="ttyPS0"
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_TRXDUO_PATH)/board/trx-duo/overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_TRXDUO_PATH)/board/trx-duo/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_TRXDUO_PATH)/board/trx-duo/post-image.sh"
+BR2_ROOTFS_POST_SCRIPT_ARGS="-c $(BR2_EXTERNAL_TRXDUO_PATH)/board/trx-duo/genimage-template.cfg"
+
+# Linux kernel: mainline 7.2.8, in-tree xilinx_zynq defconfig + TRX-duo fragment
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION_VALUE="7.2.8"
+# mainline arm defconfig (there is NO xilinx_zynq_defconfig in mainline; that
+# exists only in the Xilinx fork). multi_v7 covers Zynq-7000: ARCH_ZYNQ, MACB
+# (GEM) ethernet, Xilinx PS UART console, Arasan SDHCI. TRX-duo extras come from
+# the fragment below.
+BR2_LINUX_KERNEL_DEFCONFIG="multi_v7"
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_TRXDUO_PATH)/board/trx-duo/linux-$(BR2_LINUX_KERNEL_VERSION)_fragment"
+BR2_LINUX_KERNEL_DTS_SUPPORT=y
+BR2_LINUX_KERNEL_INTREE_DTS_NAME="xilinx/zynq-trx-duo"
+BR2_LINUX_KERNEL_DTB_OVERLAY_SUPPORT=y
+BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL=y
+
+# Packages
+BR2_PACKAGE_ZLIB=y
+BR2_PACKAGE_NCURSES=y
+BR2_PACKAGE_HAVEGED=y
+BR2_PACKAGE_DROPBEAR=y
+# Don't reverse-DNS the connecting client (the board often has no working
+# resolver, so the lookup stalls SSH logins until it times out).
+BR2_PACKAGE_DROPBEAR_DISABLE_REVERSEDNS=y
+BR2_PACKAGE_ETHTOOL=y
+BR2_PACKAGE_IPTABLES=y
+
+# Root filesystem images
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_CPIO_GZIP=y
+BR2_TARGET_ROOTFS_CPIO_UIMAGE=y
+BR2_TARGET_ROOTFS_EXT2=y
+BR2_TARGET_ROOTFS_EXT2_4=y
+
+# U-Boot: mainline v2026.07, xilinx_zynq_virt defconfig, SPL first stage
+BR2_TARGET_UBOOT=y
+BR2_TARGET_UBOOT_BUILD_SYSTEM_KCONFIG=y
+BR2_TARGET_UBOOT_CUSTOM_VERSION=y
+BR2_TARGET_UBOOT_CUSTOM_VERSION_VALUE="2026.07"
+BR2_TARGET_UBOOT_BOARD_DEFCONFIG="xilinx_zynq_virt"
+BR2_TARGET_UBOOT_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_TRXDUO_PATH)/board/trx-duo/uboot.fragment"
+BR2_TARGET_UBOOT_NEEDS_DTC=y
+BR2_TARGET_UBOOT_NEEDS_OPENSSL=y
+BR2_TARGET_UBOOT_FORMAT_IMG=y
+BR2_TARGET_UBOOT_SPL=y
+BR2_TARGET_UBOOT_SPL_NAME="spl/boot.bin"
+BR2_TARGET_UBOOT_CUSTOM_MAKEOPTS="DEVICE_TREE=zynq-trx-duo"
+
+# Host tools for genimage SD-card image
+BR2_PACKAGE_HOST_DOSFSTOOLS=y
+BR2_PACKAGE_HOST_GENIMAGE=y
+BR2_PACKAGE_HOST_MTOOLS=y
+BR2_PACKAGE_HOST_UBOOT_TOOLS=y
+
+# dtbocfg (upstream Buildroot package): out-of-tree module restoring the
+# configfs device-tree overlay interface (/sys/kernel/config/device-tree/
+# overlays/) that mainline dropped (no more CONFIG_OF_CONFIGFS). Used to program
+# the PL from Linux by applying an fpga-region overlay - see
+# board/trx-duo/led_blinker-overlay.dts. Its LINUX_CONFIG_FIXUPS auto-enable
+# CONFIG_OF_OVERLAY and CONFIG_CONFIGFS_FS in the kernel.
+BR2_PACKAGE_DTBOCFG=y
+
+# Custom packages (this external tree)
+BR2_PACKAGE_FPGAUTIL=y

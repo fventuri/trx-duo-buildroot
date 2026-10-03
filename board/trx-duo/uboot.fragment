@@ -1,0 +1,20 @@
+CONFIG_PHY_ANEG_TIMEOUT=10000
+CONFIG_PHY_LANTIQ=y
+# xilinx_zynq_virt enables the EFI capsule host tool mkeficapsule, which fails to
+# link against the host gnutls (undefined gnutls_pkcs11_*). We don't need EFI
+# capsule tooling for Zynq SD boot; disable the host tool (target EFI_LOADER stays).
+# CONFIG_TOOLS_MKEFICAPSULE is not set
+
+# Environment: the board has no dedicated env storage (we boot via boot.scr with
+# the built-in default env). xilinx_zynq_virt also enables FAT/NAND/SPI env
+# backends; FAT is tried first and fails ("No Valid Environment Area found").
+# Disable them so only ENV_IS_NOWHERE remains -> clean boot, default env used.
+# CONFIG_ENV_IS_IN_FAT is not set
+# CONFIG_ENV_IS_IN_NAND is not set
+# CONFIG_ENV_IS_IN_SPI_FLASH is not set
+CONFIG_ENV_IS_NOWHERE=y
+
+# Allow boot.scr to set ethaddr. U-Boot assigns a random MAC during net-init
+# (CONFIG_NET_RANDOM_ETHADDR) and then protects ethaddr from being changed; this
+# lets our EEPROM-derived (or placeholder) MAC overwrite it.
+CONFIG_ENV_OVERWRITE=y

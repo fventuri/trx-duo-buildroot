@@ -1,0 +1,22 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * TRX-duo: program the PL from Linux with Pavel Demin's led_blinker.
+ *
+ * Applied to the mainline zynq-7000 fpga-region (label: fpga_full,
+ * fpga-mgr = <&devcfg>).  Adding "firmware-name" to the region via an
+ * overlay makes of-fpga-region program the PL through the Zynq FPGA
+ * manager.  led_blinker is pure-PL, so there are no child device nodes.
+ *
+ * The referenced file must be a byte-swapped .bin (NOT the .bit) placed
+ * on the firmware search path (/lib/firmware).
+ */
+/dts-v1/;
+/plugin/;
+
+&fpga_full {
+	#address-cells = <1>;
+	#size-cells = <1>;
+
+	firmware-name = "led_blinker.bit.bin";
+	/* full reconfiguration: no "partial-fpga-config" */
+};

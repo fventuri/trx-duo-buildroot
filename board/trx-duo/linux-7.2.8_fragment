@@ -1,0 +1,24 @@
+# TRX-duo specific kernel options, merged on top of arm/xilinx_zynq_defconfig
+
+# Ethernet PHY on the TRX-duo is an Intel/Lantiq XWAY (GPY-series) part
+CONFIG_INTEL_XWAY_PHY=y
+
+# SPI userspace + on-board AD5624R DAC (used by some SDR front-ends)
+CONFIG_SPI_SPIDEV=y
+CONFIG_AD5624R_SPI=y
+
+# FPGA manager so the PL bitstream (e.g. Pavel Demin's led_blinker) can be
+# programmed from Linux. On mainline the only in-tree path is a device-tree
+# overlay applied to the fpga-region (fpga_full, already in zynq-7000.dtsi):
+# adding "firmware-name" makes of-fpga-region drive the Zynq FPGA manager.
+# There is NO fpga_manager sysfs "firmware" write attribute in mainline.
+CONFIG_FPGA=y
+CONFIG_FPGA_MGR_ZYNQ_FPGA=y
+CONFIG_FPGA_BRIDGE=y
+CONFIG_FPGA_REGION=y
+CONFIG_OF_FPGA_REGION=y
+# OF_OVERLAY provides the in-kernel overlay-apply API. Mainline no longer has a
+# userspace trigger for it (CONFIG_OF_CONFIGFS / drivers/of/configfs.c were
+# removed), so the out-of-tree dtbocfg module supplies the configfs interface.
+CONFIG_OF_OVERLAY=y
+CONFIG_CONFIGFS_FS=y

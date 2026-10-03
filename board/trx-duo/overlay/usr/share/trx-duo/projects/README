@@ -1,0 +1,40 @@
+TRX-duo SDR projects
+====================
+
+Each subdirectory here is one "project" loadable with:
+
+    start-project <name>      # program the PL + start the app
+    stop-project  <name>      # stop the app + unprogram the PL
+
+A project directory /usr/share/trx-duo/projects/<name>/ contains:
+
+    <name>.dtbo    (required)  Device-tree overlay applied to the mainline
+                               fpga-region (fpga_full). It must set
+                                   firmware-name = "<name>.bit.bin";
+                               and, for designs with PS<->PL AXI IP, child
+                               device nodes (compatible + reg) so their
+                               drivers probe when the overlay is applied.
+
+    app-start      (optional)  Executable run after the PL is programmed
+                               (e.g. launch an SDR daemon). Pure-PL projects
+                               like led_blinker have none.
+
+    app-stop       (optional)  Executable run before the overlay is removed.
+
+The bitstream itself is a byte-swapped .bin (NOT a .bit - the mainline Zynq
+FPGA manager requires that) installed as /lib/firmware/<name>.bit.bin, which
+is where request_firmware() looks when the overlay's firmware-name is honored.
+
+To convert a Vivado .bit:  board/trx-duo/bit2bin.py <in>.bit <out>.bit.bin
+
+Stopping and the Zynq PL
+------------------------
+There is no software "erase" of the Zynq PL. `stop-project` stops the app and
+removes the overlay (unbinding drivers, disabling the PS<->PL bridges), but the
+fabric keeps the last bitstream until it is reprogrammed or the board reboots.
+
+  - Projects with a userspace app: stopping the app is the real "stop"; the
+    idle PL design left loaded is harmless.
+  - Pure-PL projects (led_blinker): the design is autonomous, so it keeps
+    running after stop-project. To change it, `start-project <other>` (which
+    reprograms the PL) or reboot.

@@ -1,0 +1,102 @@
+#!/bin/sh
+#
+# start-project <name> - bring up an SDR "project" on the TRX-duo:
+#   1. program the PL with the project's bitstream, by applying a device-tree
+#      overlay to the mainline fpga-region (fpga_full) via the dtbocfg configfs
+#      interface - of-fpga-region then drives the Zynq FPGA manager, and
+#   2. start the project's userspace app, if it ships one.
+#
+# A project lives in /usr/share/trx-duo/projects/<name>/ and provides:
+#   <name>.dtbo            - overlay adding firmware-name="<name>.bit.bin"
+#                            (the .bit.bin itself lives in /lib/firmware/)
+#   app-start  (optional)  - executable run after the PL is programmed
+#   app-stop   (optional)  - executable run by stop-project before teardown
+#
+# Pure-PL projects (like led_blinker) ship only the .dtbo.
+
+PROJECTS_DIR=/usr/share/trx-duo/projects
+CONFIGFS=/sys/kernel/config
+OVERLAYS=$CONFIGFS/device-tree/overlays
+FPGA_STATE=/sys/class/fpga_manager/fpga0/state
+# Records the name of the gateware currently programmed into the PL, for any app
+# that must know what is loaded before it touches the fabric (e.g. a server that
+# would wedge the AXI bus if it talked to registers the running gateware does not
+# provide). Written below once the PL is programmed; cleared here before
+# (re)programming. Lives in tmpfs, so a fresh boot (no PL) starts with no record.
+CURRENT_GATEWARE=/tmp/current-gateware
+
+usage() {
+	echo "usage: start-project <name>" >&2
+	if [ -d "$PROJECTS_DIR" ]; then
+		echo "available projects:" >&2
+		for d in "$PROJECTS_DIR"/*/; do
+			[ -d "$d" ] && echo "  $(basename "$d")" >&2
+		done
+	fi
+	exit 2
+}
+
+name="$1"
+[ -n "$name" ] || usage
+projdir="$PROJECTS_DIR/$name"
+dtbo="$projdir/$name.dtbo"
+if [ ! -f "$dtbo" ]; then
+	echo "start-project: unknown project '$name' (no $dtbo)" >&2
+	usage
+fi
+
+# Make sure the dtbocfg overlay interface is available (configfs mounted +
+# module loaded). configfs is normally mounted at boot via /etc/fstab.
+if ! grep -qw configfs /proc/mounts; then
+	mount -t configfs none "$CONFIGFS" 2>/dev/null
+fi
+modprobe dtbocfg 2>/dev/null
+if [ ! -d "$OVERLAYS" ]; then
+	echo "start-project: dtbocfg configfs interface not available" >&2
+	exit 1
+fi
+
+# One PL: refuse if this or another project is already loaded.
+loaded=$(ls "$OVERLAYS" 2>/dev/null)
+if [ -n "$loaded" ]; then
+	echo "start-project: a project is already loaded ($loaded); stop it first" >&2
+	exit 1
+fi
+
+# No project is loaded (checked above); drop any stale record before we (re)program
+# the PL, so nothing reads it as valid while the fabric is mid-change.
+rm -f "$CURRENT_GATEWARE"
+
+echo "start-project: programming PL for '$name'..."
+ov="$OVERLAYS/$name"
+mkdir "$ov" || exit 1
+if ! cat "$dtbo" > "$ov/dtbo"; then
+	echo "start-project: failed to stage overlay" >&2
+	rmdir "$ov" 2>/dev/null
+	exit 1
+fi
+echo 1 > "$ov/status" 2>/dev/null
+
+state=$(cat "$FPGA_STATE" 2>/dev/null || echo unknown)
+if [ "$state" != "operating" ]; then
+	echo "start-project: FPGA not programmed (fpga0 state=$state); rolling back" >&2
+	echo 0 > "$ov/status" 2>/dev/null
+	rmdir "$ov" 2>/dev/null
+	exit 1
+fi
+echo "start-project: PL programmed (fpga0 state=$state)"
+
+if [ -x "$projdir/app-start" ]; then
+	echo "start-project: starting '$name' app..."
+	"$projdir/app-start" || {
+		echo "start-project: app-start failed" >&2
+		exit 1
+	}
+fi
+
+# The PL is up: record which gateware is running, so apps can tell before they
+# touch the fabric. Written for every project (gateware-agnostic); consumers decide
+# whether the loaded name is one they can talk to.
+echo "$name" > "$CURRENT_GATEWARE"
+echo "start-project: current gateware '$name' recorded in $CURRENT_GATEWARE"
+echo "start-project: '$name' started."

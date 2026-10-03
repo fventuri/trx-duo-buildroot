@@ -1,0 +1,28 @@
+From: fcfb project
+Subject: [PATCH] net: macb: enable jumbo frames on Zynq-7000 (GEM)
+
+The Cadence GEM on the Zynq-7000 supports jumbo frames but the mainline
+zynq_config leaves them disabled, capping MTU at 1500. fcfb streams selected
+FFT bins as datagram-atomic UDP records at 40k blocks/s; at MTU 1500 a record
+over ~1460 B fragments and the doubled packet rate collapses throughput. Enable
+MACB_CAPS_JUMBO with jumbo_max_len=10240 (max_mtu becomes min(10240,16320)-18 =
+10222) so the board can egress larger unfragmented datagrams. Per Pavel Demin
+(RedPitaya forum t=25577) the board->host (TX-from-GEM) direction sustains
+~960 Mbit/s at raised MTU; host->board (RX) may misbehave above ~2340, but for
+fcfb that direction carries only tiny TCP control requests.
+
+Signed-off-by: fcfb project <fcfb@localhost>
+---
+--- a/drivers/net/ethernet/cadence/macb_main.c
++++ b/drivers/net/ethernet/cadence/macb_main.c
+@@ -5637,8 +5637,10 @@
+ static const struct macb_config zynq_config = {
+ 	.caps = MACB_CAPS_GIGABIT_MODE_AVAILABLE | MACB_CAPS_NO_GIGABIT_HALF |
+ 		MACB_CAPS_NEEDS_RSTONUBR |
++		MACB_CAPS_JUMBO |
+ 		MACB_CAPS_USRIO_HAS_MII,
+ 	.dma_burst_length = 16,
++	.jumbo_max_len = 10240,
+ 	.usrio = &at91_default_usrio,
+ };
+ 

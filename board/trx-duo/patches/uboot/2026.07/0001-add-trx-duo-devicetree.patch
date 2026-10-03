@@ -1,0 +1,100 @@
+Add a U-Boot device tree for the TRX-duo (Zynq-7010) SDR board.
+
+Built with DEVICE_TREE=zynq-trx-duo (see the defconfig). Uses the mainline
+xilinx_zynq_virt defconfig; only this board DTS is added.
+
+NOTE: the arch/arm/dts/Makefile context below is from v2026.04; if it fails to
+apply against v2026.07, refresh the Makefile hunk (see claude/).
+
+Signed-off-by: Franco Venturi <fventuri@comcast.net>
+
+--- a/arch/arm/dts/Makefile
++++ b/arch/arm/dts/Makefile
+@@ -240,6 +240,7 @@
+ 	zynq-topic-miami.dtb \
+ 	zynq-topic-miamilite.dtb \
+ 	zynq-topic-miamiplus.dtb \
++	zynq-trx-duo.dtb \
+ 	zynq-zc702.dtb \
+ 	zynq-zc706.dtb \
+ 	zynq-zc770-xm010.dtb \
+--- /dev/null
++++ b/arch/arm/dts/zynq-trx-duo.dts
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * TRX-duo SDR DTS
++ *
++ *  Copyright (C) 2011 - 2015 Xilinx
++ */
++/dts-v1/;
++#include "zynq-7000.dtsi"
++
++/ {
++	model = "TRX-duo SDR";
++	compatible = "trx-duo,zynq-trx-duo", "xlnx,zynq-7000";
++
++	aliases {
++		ethernet0 = &gem0;
++		serial0 = &uart0;
++		mmc0 = &sdhci0;
++		i2c0 = &i2c0;
++		nvmem0 = &eeprom;
++	};
++
++	memory@0 {
++		device_type = "memory";
++		reg = <0x0 0x1E000000>;
++	};
++
++	chosen {
++		bootargs = "earlycon";
++		stdout-path = "serial0:115200n8";
++	};
++
++	usb_phy0: phy0 {
++		compatible = "usb-nop-xceiv";
++		#phy-cells = <0>;
++		reset-gpios = <&gpio0 46 1>;
++	};
++};
++
++&clkc {
++	ps-clk-frequency = <33333333>;
++};
++
++&gem0 {
++	status = "okay";
++	phy-mode = "rgmii-id";
++	phy-handle = <&ethernet_phy>;
++
++	ethernet_phy: ethernet-phy@0 {
++		reg = <0>;
++		device_type = "ethernet-phy";
++	};
++};
++
++&sdhci0 {
++	bootph-all;
++	status = "okay";
++};
++
++&i2c0 {
++	status = "okay";
++	clock-frequency = <400000>;
++	eeprom: eeprom@50 {
++		compatible = "atmel,24c64";
++		reg = <0x50>;
++	};
++};
++
++&uart0 {
++	bootph-all;
++	status = "okay";
++};
++
++&usb0 {
++	status = "okay";
++	dr_mode = "host";
++	usb-phy = <&usb_phy0>;
++};

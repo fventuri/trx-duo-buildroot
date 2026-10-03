@@ -1,0 +1,4 @@
+# Locally calculated from the kernel.org mainline tarball (7.2.8 is newer than the
+# buildroot-known 7.1.x, so buildroot ships no hash for it; this silences the
+# "no hash found for linux-7.2.8.tar.xz" download warning for our custom version).
+sha256  12e8d5a973d1ad7c5a5c69882e4022b131ed715db7003fdcd760ddf8c3e51941  linux-7.2.8.tar.xz
