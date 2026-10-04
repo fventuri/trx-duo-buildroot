@@ -87,6 +87,12 @@ Full documentation — the mainline-only toolchain rationale, the boot chain, an
 led_blinker demo — is published at
 <https://fventuri.github.io/trx-duo-buildroot/>.
 
+## Contributing
+
+Pull requests are not accepted; instead, please open an issue for any bug, change,
+or improvement, and we will discuss and implement it together. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for details.
+
 ## License
 
 [MIT](LICENSE) © Franco Venturi.
